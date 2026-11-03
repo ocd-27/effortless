@@ -63,6 +63,9 @@ export type SettingsDraft = {
   modelAuto?: string
   /** on: each subagent gets an effort picked by the judge before it starts; off: it runs at the chat's effort. */
   helpers?: string
+  /** on: a subagent's own definition keeps the effort it pins, instead of the judge's or the turn's; off: the old
+   * behaviour, where a pin cannot be told apart from an inherited effort. */
+  respectSubagentEffort?: string
   /** violet (the brand), orange (Claude's) or rose (cherry blossom). */
   theme?: string
   appearance?: string

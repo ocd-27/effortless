@@ -3862,6 +3862,79 @@ describe('agent panel', () => {
     expect(sent.map(s => s.effort)).toEqual(['xhigh', 'medium'])
   })
 
+  test("a subagent's pinned effort from its provider plugin's agents/<type>.md frontmatter is kept, not overridden by a judged turn", async ($, on) => {
+    engine(on)
+    on('model.complete', (_$, e) => ({ value: { isAnswered: true as const, text: '{"model":"opus","effort":"xhigh","why":"hard"}', usage: USAGE } }))
+    on('fs.read', (_$, e) => {
+      const path = String(e.path).replaceAll('\\', '/')
+      if (path.endsWith('installed_plugins.json')) return { value: JSON.stringify({ plugins: { 'claude-kit@claude-kit': [{ installPath: '/plugins/claude-kit' }] } }) } as never
+      if (path.endsWith('agents/savvy-light.md')) return { value: '---\nmodel: opus\neffort: low\n---\nBody.' } as never
+      return { value: '' } as never
+    })
+    on('agent.spawn', () => ({ agentId: 'p1', model: 'claude-opus-5-5' }) as never)
+    const sent = recordSteps(on)
+    await $.prompt.submit({ text: 'rename a few files across the repo', wait: false, origin: { kind: 'composer' } })
+    await $.agent.spawn({ prompt: 'rename utils.ts to helpers.ts', description: 'rename file', subagentType: 'savvy-light', provider: { plugin: 'claude-kit', tier: 'user' } } as never)
+    for await (const _ of $.turn.step({ turnId: 't1', index: 0, model: 'claude-opus-5-5', effort: 'low', messageCount: 1, agentId: 'p1' } as never)) {
+      // drain
+    }
+    // The turn was judged xhigh; a pin stays low, not raised to it (and not floored to medium, unlike a Helpers pick).
+    expect(sent.map(s => s.effort)).toEqual(['low'])
+  })
+
+  test("the same pinned subagent runs at the turn's effort when Subagent effort pins is switched off", { options: { respectSubagentEffort: 'off' } } as never, async ($, on) => {
+    engine(on)
+    on('model.complete', (_$, e) => ({ value: { isAnswered: true as const, text: '{"model":"opus","effort":"xhigh","why":"hard"}', usage: USAGE } }))
+    on('fs.read', (_$, e) => {
+      const path = String(e.path).replaceAll('\\', '/')
+      if (path.endsWith('installed_plugins.json')) return { value: JSON.stringify({ plugins: { 'claude-kit@claude-kit': [{ installPath: '/plugins/claude-kit' }] } }) } as never
+      if (path.endsWith('agents/savvy-light.md')) return { value: '---\nmodel: opus\neffort: low\n---\nBody.' } as never
+      return { value: '' } as never
+    })
+    on('agent.spawn', () => ({ agentId: 'p2', model: 'claude-opus-5-5' }) as never)
+    const sent = recordSteps(on)
+    await $.prompt.submit({ text: 'rename a few files across the repo', wait: false, origin: { kind: 'composer' } })
+    await $.agent.spawn({ prompt: 'rename utils.ts to helpers.ts', description: 'rename file', subagentType: 'savvy-light', provider: { plugin: 'claude-kit', tier: 'user' } } as never)
+    for await (const _ of $.turn.step({ turnId: 't1', index: 0, model: 'claude-opus-5-5', effort: 'low', messageCount: 1, agentId: 'p2' } as never)) {
+      // drain
+    }
+    // Switched off: today's behaviour, raised to the judged turn's effort (never below medium).
+    expect(sent.map(s => s.effort)).toEqual(['xhigh'])
+  })
+
+  test("a subagent with no readable frontmatter effort falls back to today's behaviour (the judged turn's effort)", async ($, on) => {
+    engine(on)
+    on('model.complete', (_$, e) => ({ value: { isAnswered: true as const, text: '{"model":"opus","effort":"high","why":"tricky"}', usage: USAGE } }))
+    on('fs.read', () => { throw new Error('ENOENT') })
+    on('agent.spawn', () => ({ agentId: 'p3', model: 'claude-opus-5-5' }) as never)
+    const sent = recordSteps(on)
+    await $.prompt.submit({ text: 'explain the auth flow', wait: false, origin: { kind: 'composer' } })
+    await $.agent.spawn({ prompt: 'read auth.ts', description: 'read auth', subagentType: 'Explore', provider: { plugin: 'some-plugin', tier: 'user' } } as never)
+    for await (const _ of $.turn.step({ turnId: 't1', index: 0, model: 'claude-opus-5-5', effort: 'medium', messageCount: 1, agentId: 'p3' } as never)) {
+      // drain
+    }
+    expect(sent.map(s => s.effort)).toEqual(['high'])
+  })
+
+  test('a built-in subagent (no plugin) is never looked up for a pin', async ($, on) => {
+    engine(on)
+    on('model.complete', (_$, e) => ({ value: { isAnswered: true as const, text: '{"model":"opus","effort":"high","why":"tricky"}', usage: USAGE } }))
+    const reads: string[] = []
+    on('fs.read', (_$, e) => {
+      reads.push(String(e.path))
+      return { value: '' } as never
+    })
+    on('agent.spawn', () => ({ agentId: 'p4', model: 'claude-opus-5-5' }) as never)
+    const sent = recordSteps(on)
+    await $.prompt.submit({ text: 'find the hooks', wait: false, origin: { kind: 'composer' } })
+    await $.agent.spawn({ prompt: 'look around', description: 'find the hooks', subagentType: 'Explore', provider: { plugin: 'engine', tier: 'core' } } as never)
+    for await (const _ of $.turn.step({ turnId: 't1', index: 0, model: 'claude-opus-5-5', effort: 'medium', messageCount: 1, agentId: 'p4' } as never)) {
+      // drain
+    }
+    expect(reads.some(p => p.includes('installed_plugins.json'))).toBe(false)
+    expect(sent.map(s => s.effort)).toEqual(['high'])
+  })
+
   test('the demo map shows the parts touched; a part opens to its files', async ($, on) => {
     await start($, on)
     await $.command.run({ command: 'effortless', args: 'agents demo' })
