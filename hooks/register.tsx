@@ -618,6 +618,10 @@ export type JudgeConfig = {
   modelAuto: 'on' | 'off'
   /** on: every subagent the chat sends off gets an effort picked by the judge before it starts. */
   helpers: 'on' | 'off'
+  /** on: a subagent's own definition (its provider plugin's agents/<type>.md frontmatter) keeps the effort it
+   * pins, instead of the judge's or the turn's. off: the old behaviour, where a pin cannot be told apart from an
+   * inherited effort (see turn.step), so it is overridden the same way. */
+  respectSubagentEffort: 'on' | 'off'
   /** The accent colour of everything effortless draws: the brand violet, Claude orange or cherry-blossom rose. */
   theme: ThemeName
   /** auto: light when Claude Code's own theme is light. dark and light fix it. */
@@ -649,6 +653,7 @@ let config: JudgeConfig = {
   handoffButton: 'advised',
   modelAuto: 'off',
   helpers: 'off',
+  respectSubagentEffort: 'on',
   theme: 'violet',
   appearance: 'auto',
 }
@@ -674,6 +679,7 @@ export function readConfig(options: unknown): JudgeConfig {
     // more than it saves in a chat that is in use (measured 2026-10-10).
     modelAuto: str(o.modelAuto) === 'on' ? 'on' : 'off',
     helpers: str(o.helpers) === 'on' ? 'on' : 'off',
+    respectSubagentEffort: str(o.respectSubagentEffort) === 'off' ? 'off' : 'on',
     theme: THEMES.find(t => t === str(o.theme)) ?? 'violet',
     appearance: (['dark', 'light'] as const).find(a => a === str(o.appearance)) ?? 'auto',
     // The judge's line is off until switched on; an empty string saved from the panel means everything shows.
@@ -1805,6 +1811,7 @@ const SETTING_FIELDS = {
   handoffButton: 'handoffButton',
   modelAuto: 'modelAuto',
   helpers: 'helpers',
+  respectSubagentEffort: 'respectSubagentEffort',
   theme: 'theme',
   appearance: 'appearance',
 } as const
@@ -1836,6 +1843,7 @@ async function saveSetting($: EngineInterface, field: keyof typeof SETTING_FIELD
     handoffButton: config.handoffButton,
     modelAuto: config.modelAuto,
     helpers: config.helpers,
+    respectSubagentEffort: config.respectSubagentEffort,
     theme: config.theme,
     appearance: config.appearance,
     [SETTING_FIELDS[field]]: value,
@@ -3238,6 +3246,8 @@ let autoOnAt = -Infinity
 let autoFlipAt = 0
 let helpersSeen: string | undefined
 let helpersFlipAt = 0
+let respectSeen: string | undefined
+let respectFlipAt = 0
 
 /** The dashboard: what effortless is doing, and Auto, Handoff and settings. The slot above the prompt at rest. */
 async function dashboardBand($: EngineInterface, e: RenderInput<'AbovePrompt'>) {
@@ -3627,6 +3637,11 @@ async function agentCost($: EngineInterface, id: string, cost: number) {
 const helperPicks = new Map<string, Effort>()
 let helperWaiting: { description: string; type: string; parentId?: string; effort: Effort }[] = []
 
+// Effort a subagent's own definition pins, by its agentId: read once at spawn from its provider plugin's
+// agents/<type>.md frontmatter, since turn.step cannot tell a pin apart from an inherited effort (see there).
+// Kept for the chat's lifetime, as helperPicks is.
+const subagentPinnedEffort = new Map<string, Effort>()
+
 /** What the judge reads for a subagent: its task, said to be one, so it judges the subagent's work. */
 export function helperQuestion(prompt: string, type: string): string {
   return `${prompt.slice(0, 4000)}
@@ -3639,6 +3654,23 @@ export function helperQuestion(prompt: string, type: string): string {
 export function helperFloor(floor: Effort, ceiling: Effort): Effort {
   const i = Math.min(Math.max(EFFORTS.indexOf(floor), EFFORTS.indexOf('medium')), EFFORTS.indexOf(ceiling))
   return EFFORTS[i]
+}
+
+/** The effort a subagent's own definition pins, from its provider plugin's agents/<type>.md frontmatter (the
+ * engine resolves a subagent's model the same way, definition before parent — see the Agent tool's own model
+ * parameter). Undefined for a built-in (no plugin, so no file) or when the plugin, its install path, the file or
+ * an effort field in it cannot be found: turn.step then keeps today's behaviour, untouched. */
+async function frontmatterEffortOf($: EngineInterface, subagentType: string, pluginName: string | undefined): Promise<Effort | undefined> {
+  if (!pluginName || pluginName === 'engine') return undefined
+  const home = $.plugin.root.replace(/[\\/]cache[\\/].*$/, '')
+  const record = JSON.parse(String(await $.fs.read(`${home}/installed_plugins.json`))) as { plugins?: Record<string, { installPath?: unknown }[]> }
+  const key = Object.keys(record.plugins ?? {}).find(k => k === pluginName || k.split('@')[0] === pluginName)
+  const installPath = key ? record.plugins?.[key]?.map(x => x.installPath).filter((x): x is string => typeof x === 'string').at(-1) : undefined
+  if (!installPath) return undefined
+  const text = String(await $.fs.read(`${installPath}/agents/${subagentType}.md`))
+  const front = /^---\r?\n([\s\S]*?)\r?\n---/.exec(text)?.[1]
+  const value = front ? /^effort:\s*["']?(\w+)["']?\s*$/m.exec(front)?.[1] : undefined
+  return value && (EFFORTS as readonly string[]).includes(value) ? (value as Effort) : undefined
 }
 
 /** The judge's effort for a subagent's task, within the person's slider, Min and Max and save mode; null without a verdict. */
@@ -4238,6 +4270,11 @@ Saved to ${out}.md and .json` }
       if (picked && picked.by !== 'manual' && result.usage) await tally($, picked.effort, result.usage)
       return result
     }
+    // A subagent whose own definition pins an effort (found at its spawn, frontmatterEffortOf): leave it, unless
+    // this is switched off to go back to the old behaviour, where a pin is treated as inherited (see below).
+    if (e.agentId !== undefined && config.respectSubagentEffort === 'on' && subagentPinnedEffort.has(e.agentId)) {
+      return yield* send(e)
+    }
     // A helper the judge picked an effort for at its spawn runs every request at it. Haiku takes no effort.
     if (e.agentId !== undefined && config.helpers === 'on' && typeof e.effort === 'string' && keyOf(e.model) !== 'haiku') {
       const effort = await helperEffortOf($, e.agentId)
@@ -4386,6 +4423,11 @@ Saved to ${out}.md and .json` }
       : null
     const waiting = helper ? { description: e.description, type: e.subagentType, parentId: e.parentAgentId, effort: helper.effort } : null
     if (waiting) helperWaiting = [...helperWaiting, waiting].slice(-20)
+    // A pin in the subagent's own definition, read now because turn.step cannot find it once the request is in
+    // flight (see frontmatterEffortOf and the turn.step comment on a definition's effort vs. an inherited one).
+    const pinned = config.respectSubagentEffort === 'on' && !e.fork && !e.isTeammate && !e.workflow
+      ? await frontmatterEffortOf($, e.subagentType, (e as { provider?: { plugin?: string } }).provider?.plugin).catch(() => undefined)
+      : undefined
     const result = await next(e)
     if (waiting) {
       helperWaiting = helperWaiting.filter(w => w !== waiting)
@@ -4398,6 +4440,7 @@ Saved to ${out}.md and .json` }
         void proof($, `helper ${e.subagentType} "${e.description}": ${waiting.effort} (${helper?.why})`)
       }
     }
+    if (pinned && 'agentId' in result && result.agentId) subagentPinnedEffort.set(result.agentId, pinned)
     if (e.isTeammate || e.workflow || !('agentId' in result) || !result.agentId) return result
     const id = result.agentId
     const now = await $.clock.now()
@@ -4561,6 +4604,7 @@ Saved to ${out}.md and .json` }
         handoffButton: draft.handoffButton ?? config.handoffButton,
         modelAuto: draft.modelAuto ?? config.modelAuto,
         helpers: draft.helpers ?? config.helpers,
+        respectSubagentEffort: draft.respectSubagentEffort ?? config.respectSubagentEffort,
         theme: draft.theme ?? config.theme,
         appearance: draft.appearance ?? config.appearance,
       }
@@ -4568,6 +4612,8 @@ Saved to ${out}.md and .json` }
       const helpersNow = await $.clock.now()
       if (helpersSeen !== undefined && helpersSeen !== shown.helpers) helpersFlipAt = helpersNow
       helpersSeen = shown.helpers
+      if (respectSeen !== undefined && respectSeen !== shown.respectSubagentEffort) respectFlipAt = helpersNow
+      respectSeen = shown.respectSubagentEffort
       // Dirty only while the draft differs from what is saved: a control set back to its saved value is no change.
       const sameSet = (a: string, b: string) => a.split(',').filter(Boolean).sort().join() === b.split(',').filter(Boolean).sort().join()
       const dirty = Object.entries(draft).some(([field, value]) =>
@@ -4812,6 +4858,24 @@ Saved to ${out}.md and .json` }
                       <Button key="settings-helpers-switch" plain label={`${shown.helpers === 'on' ? '◉' : '○'} Helpers`} onPress={() => set('helpers')(shown.helpers === 'on' ? 'off' : 'on')} />
                     )}
                     <Text dimColor wrap="truncate">{shown.helpers === 'on' ? "The judge picks each subagent's effort, medium or more" : "Subagents run at the chat's effort"}</Text>
+                  </Box>,
+                  // A pin in a subagent's own definition (another plugin's, e.g. a tiered worker) is kept as that
+                  // plugin set it, instead of being treated as inherited from the chat's turn or Helpers' judge.
+                  <Box key="settings-respect-row" width="100%" flexDirection="row" alignItems="center" gap={1}>
+                    {Svg && !term ? (
+                      <Box key="settings-respect" position="relative" flexDirection="row" alignItems="center" gap={1} paddingX={1}>
+                        <Svg source={autoSwitchSvg(shown.respectSubagentEffort === 'on', helpersNow - respectFlipAt)} alt={shown.respectSubagentEffort === 'on' ? 'Respect subagent effort on' : 'Respect subagent effort off'} width={26} height={15} />
+                        <Text color={shown.respectSubagentEffort === 'on' ? DASH_TEXT : DASH_DIM}>Subagent effort pins</Text>
+                        <Box position="absolute" top={0} bottom={0} left={0} right={0} flexDirection="row" alignItems="center" justifyContent="center" overflow="hidden">
+                          <Box flexShrink={0}>
+                            <Button key="settings-respect-switch" plain hover={{ backgroundColor: '#00000000' }} label={'\u00a0'.repeat(40)} onPress={() => set('respectSubagentEffort')(shown.respectSubagentEffort === 'on' ? 'off' : 'on')} />
+                          </Box>
+                        </Box>
+                      </Box>
+                    ) : (
+                      <Button key="settings-respect-switch" plain label={`${shown.respectSubagentEffort === 'on' ? '◉' : '○'} Subagent effort pins`} onPress={() => set('respectSubagentEffort')(shown.respectSubagentEffort === 'on' ? 'off' : 'on')} />
+                    )}
+                    <Text dimColor wrap="truncate">{shown.respectSubagentEffort === 'on' ? "A subagent's own definition keeps the effort it pins" : "A pin is treated as inherited, like before"}</Text>
                   </Box>,
                 ]),
 ] : card === 'judge' ? (bare ? [] : [

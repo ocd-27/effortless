@@ -104,6 +104,16 @@
         "off"
       ]
     },
+    "respectSubagentEffort": {
+      "type": "string",
+      "title": "Subagent effort pins",
+      "description": "on (default): a subagent whose own definition pins an effort (another plugin's agents/<type>.md frontmatter) keeps it, instead of the judge's (Helpers) or the chat turn's. off: the old behaviour, where a pin cannot be told apart from an inherited effort, and is overridden the same way.",
+      "default": "on",
+      "options": [
+        "on",
+        "off"
+      ]
+    },
     "handoffButton": {
       "type": "string",
       "title": "Handoff button",
